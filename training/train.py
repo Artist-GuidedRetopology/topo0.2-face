@@ -3,9 +3,9 @@ Training loop for topo0.2-face (face dual graph, dual 2θ + singularity).
 
     conda activate topo_lab
     cd lab/topo0.2-face
-    python train.py
-    python train.py --data /path/to/dataset_preproc
-    python train.py --data /path/to/dataset_preproc --epochs 10 --device auto
+    python training/train.py
+    python training/train.py --data /path/to/dataset_preproc
+    python training/train.py --data /path/to/dataset_preproc --epochs 10 --device auto
 
 Without --data (and with config PREPROC_PLY_ROOT=None), uses a synthetic graph.
 """

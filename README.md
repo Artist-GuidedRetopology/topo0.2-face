@@ -20,17 +20,19 @@ pip install -r requirements.txt
 
 ```
 topo0.2-face/
-  config.py           # PREPROC_PLY_ROOT + TrainConfig
-  dataset.py          # PLY → PyG Data (+ mesh verts / face frames)
-  geometry_frames.py  # local (T,B,N) + 2θ encode/decode (matches preproc)
-  field_smooth.py     # RoSy neighbor smoothing on face dual graph
-  model.py            # FaceRetopoGNN (GATv2, dual dir heads + sing)
-  losses.py           # axial + swap-invariant dir loss + BCE sing
-  train.py
-  visualize.py        # true tangent-frame OBJ glyphs (pred / gt / feat)
-  check_frames.py     # GT 2θ round-trip self-check (no model)
-  viz_flow.py         # **look here first** — mesh + flow_gt / flow_pred OBJs
-  export_field.py     # remesh-ready package: mesh + world dirs + smooth
+  training/             # all code; run scripts from the repo root
+    config.py           # paths + TrainConfig
+    dataset.py          # PLY → PyG Data (+ mesh verts / face frames)
+    geometry_frames.py  # local (T,B,N) + 2θ encode/decode (matches preproc)
+    field_smooth.py     # RoSy neighbor smoothing on face dual graph
+    model.py            # FaceRetopoGNN (GATv2, dual dir heads + sing)
+    losses.py           # axial + swap-invariant dir loss + BCE sing
+    train.py
+    visualize.py        # true tangent-frame OBJ glyphs (pred / gt / feat)
+    check_frames.py     # GT 2θ round-trip self-check (no model)
+    viz_flow.py         # **look here first** — mesh + flow_gt / flow_pred OBJs
+    export_field.py     # remesh-ready package: mesh + world dirs + smooth
+    build_holdout_ufbx.py  # optional: build holdout dirty PLYs without Blender
 
   data/               # preproc PLY datasets (local, git-ignored)
   checkpoints/        # one subdir per run: best.pt + history.json (local, git-ignored)
@@ -45,26 +47,26 @@ dataset (or a symlink to it) under `data/`, and give each training run its own
 
 ```bash
 conda activate topo_lab
-cd lab/topo0.2-face
+cd topo0.2-face   # repo root
 
 # synthetic smoke test
-python train.py
+python training/train.py
 
 # tiny real preproc (2 dirty PLYs, ~10s for 5 epochs) — recommended first
-python train.py --data ./data/tiny_preproc --epochs 5 --device auto
+python training/train.py --data ./data/tiny_preproc --epochs 5 --device auto
 
 # full preproc output, one checkpoint subdir per run
-python train.py --data ./data/<dataset_preproc> --epochs 30 --device auto \
+python training/train.py --data ./data/<dataset_preproc> --epochs 30 --device auto \
   --checkpoint-dir ./checkpoints/<run_name>
-python visualize.py --data ./data/<dataset_preproc> --ckpt ./checkpoints/<run_name>/best.pt
-python check_frames.py --data ./data/tiny_preproc
+python training/visualize.py --data ./data/<dataset_preproc> --ckpt ./checkpoints/<run_name>/best.pt
+python training/check_frames.py --data ./data/tiny_preproc
 
 # visualize flow (recommended validation path)
-python viz_flow.py --data ./data/tiny_preproc
-python viz_flow.py --data ./data/tiny_preproc --gt-only    # teacher only
+python training/viz_flow.py --data ./data/tiny_preproc
+python training/viz_flow.py --data ./data/tiny_preproc --gt-only    # teacher only
 
 # export mesh + world cross-field (for later remesh experiments)
-python export_field.py --data ./data/tiny_preproc --smooth 15
+python training/export_field.py --data ./data/tiny_preproc --smooth 15
 ```
 
 `config.PREPROC_PLY_ROOT` is only an optional default; `--data` overrides it.

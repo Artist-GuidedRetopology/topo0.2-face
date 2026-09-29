@@ -14,9 +14,9 @@ Tips for Blender:
 
     conda activate topo_lab
     cd lab/topo0.2-face
-    python viz_flow.py --data ./data/tiny_preproc
-    python viz_flow.py --data ./data/tiny_preproc --gt-only          # no model
-    python viz_flow.py --data ./data/tiny_preproc --every 8 --smooth 10
+    python training/viz_flow.py --data ./data/tiny_preproc
+    python training/viz_flow.py --data ./data/tiny_preproc --gt-only          # no model
+    python training/viz_flow.py --data ./data/tiny_preproc --every 8 --smooth 10
 """
 
 from __future__ import annotations

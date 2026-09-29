@@ -1,7 +1,7 @@
 """
 Standalone GT frame round-trip check (no model needed).
 
-    python check_frames.py --data ./data/tiny_preproc
+    python training/check_frames.py --data ./data/tiny_preproc
 """
 
 from __future__ import annotations

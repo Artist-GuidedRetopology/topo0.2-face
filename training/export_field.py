@@ -18,7 +18,7 @@ Then (from repo `Remesh/`):
 
     conda activate topo_lab
     cd lab/topo0.2-face
-    python export_field.py --data ./data/tiny_preproc --smooth 15
+    python training/export_field.py --data ./data/tiny_preproc --smooth 15
 """
 
 from __future__ import annotations

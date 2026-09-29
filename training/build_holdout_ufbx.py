@@ -6,7 +6,7 @@ Dirty: triangulate + tangent-plane displace + random edge collapses (trimesh).
 Labels: current preproc quad-edge flow (calc_edge_flow).
 
     pip install ufbx
-    python build_holdout_ufbx.py \
+    python training/build_holdout_ufbx.py \
         --fbx-root /path/to/input_character_fbx \
         --out ./data/holdout_preproc \
         --preproc-root /path/to/mesh_retopo_data_preproc \
@@ -32,7 +32,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--preproc-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "perface-data-preproc-pipeline" / "mesh_retopo_data_preproc",
+        default=Path(__file__).resolve().parents[2] / "perface-data-preproc-pipeline" / "mesh_retopo_data_preproc",
         help="mesh_retopo_data_preproc checkout (provides src.*)",
     )
     # Outside training: Aj / Arissa / Big_Vegas / Brute / akai_e_espiritu

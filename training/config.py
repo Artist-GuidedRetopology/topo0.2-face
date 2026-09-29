@@ -8,13 +8,13 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Optional default preproc PLY root (character subdirs with feature/label .ply).
 # Prefer passing at runtime:
-#   python train.py --data /path/to/dataset_preproc
+#   python training/train.py --data /path/to/dataset_preproc
 # Leave None (and no --data) to use a synthetic face-graph demo.
 # ---------------------------------------------------------------------------
 PREPROC_PLY_ROOT: str | None = None
 
 # Local, git-ignored folders: data/ (preproc PLYs), checkpoints/ (weights), results/ (viz/export)
-ROOT_DIR: Path = Path(__file__).resolve().parent
+ROOT_DIR: Path = Path(__file__).resolve().parents[1]
 DATA_DIR: Path = ROOT_DIR / "data"
 CHECKPOINT_DIR: Path = ROOT_DIR / "checkpoints"
 RESULTS_DIR: Path = ROOT_DIR / "results"
