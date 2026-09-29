@@ -1,0 +1,14 @@
+# Local-only folders (see README "Folder layout"); keep the empty dirs via .gitkeep
+data/*
+!data/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+results/*
+!results/.gitkeep
+
+# Local pip --target installs (e.g. ufbx for build_holdout_ufbx.py)
+.pydeps/
+
+__pycache__/
+*.pyc
+.DS_Store

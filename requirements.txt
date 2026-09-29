@@ -1,0 +1,7 @@
+torch>=2.1
+torch_geometric>=2.5
+numpy>=1.24
+# build_holdout_ufbx.py only
+scipy>=1.10
+trimesh>=4.0
+ufbx
