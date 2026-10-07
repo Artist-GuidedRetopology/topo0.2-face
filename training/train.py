@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.loader import DataLoader
 
+from checkpoint import build_model, save_checkpoint
 from config import CHECKPOINT_DIR, TrainConfig, resolve_device
-from dataset import load_datasets
+from dataset import load_datasets, ply_to_data
 from losses import FaceFlowLoss
 from model import FaceRetopoGNN
 
@@ -97,10 +100,34 @@ def _run_epoch(
     }
 
 
+def _warm_one(args: tuple[str, list[str] | None]) -> str | None:
+    path, groups = args
+    try:
+        ply_to_data(Path(path), groups, with_mesh=False)
+        return None
+    except Exception as exc:  # reported, then training raises on the same file
+        return f"{path}: {exc}"
+
+
+def warm_cache(paths: list[Path], groups: list[str], workers: int) -> None:
+    """Parse every PLY once in parallel so epoch 1 is not bound by ASCII parsing."""
+    if workers <= 1 or not paths:
+        return
+    t0 = time.time()
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        errors = [e for e in pool.map(_warm_one, [(str(p), groups) for p in paths], chunksize=4) if e]
+    for e in errors:
+        print(f"  ! cache: {e}")
+    print(f"[cache] {len(paths)} PLYs ready in {time.time() - t0:.0f}s ({workers} workers)", flush=True)
+
+
 def train(
     cfg: TrainConfig | None = None,
     ply_root: str | None = None,
     checkpoint_dir: Path | None = None,
+    feature_groups: list[str] | None = None,
+    norm: str = "v2",
+    cache_workers: int = 6,
 ) -> None:
     cfg = cfg or TrainConfig()
     out_dir = checkpoint_dir or CHECKPOINT_DIR
@@ -110,11 +137,20 @@ def train(
     print("=" * 56)
     print("topo0.2-face training")
     print("=" * 56)
-    print(f"device={device}  epochs={cfg.epochs}  hidden={cfg.hidden_channels}")
+    print(f"device={device}  epochs={cfg.epochs}  hidden={cfg.hidden_channels}  norm={norm}")
     if ply_root:
         print(f"data={ply_root}")
 
-    train_ds, val_ds = load_datasets(cfg, ply_root=ply_root)
+    train_ds, val_ds = load_datasets(
+        cfg, ply_root=ply_root, feature_groups=feature_groups, norm=norm, with_mesh=False
+    )
+    cfg.in_channels = len(train_ds.feature_columns)
+    print(f"features ({cfg.in_channels} cols): {', '.join(train_ds.feature_groups)}")
+    warm_cache(
+        train_ds.paths + (val_ds.paths if val_ds is not None else []),
+        train_ds.feature_groups,
+        cache_workers,
+    )
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     val_loader = (
         DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
@@ -131,13 +167,7 @@ def train(
     if val_loader is not None and val_ds is not None:
         print(f"val graphs={len(val_ds)}")
 
-    model = FaceRetopoGNN(
-        in_channels=cfg.in_channels,
-        hidden_channels=cfg.hidden_channels,
-        num_layers=cfg.num_layers,
-        heads=cfg.heads,
-        dropout=cfg.dropout,
-    ).to(device)
+    model = build_model(cfg, cfg.in_channels, device)
 
     criterion = FaceFlowLoss(lambda_sing=cfg.lambda_sing)
     optimizer = torch.optim.AdamW(
@@ -150,7 +180,9 @@ def train(
     history: list[dict] = []
     monitor_tag = "val" if val_loader is not None else "train"
 
+    hist_path = out_dir / "history.json"
     for epoch in range(1, cfg.epochs + 1):
+        t_epoch = time.time()
         train_parts = _run_epoch(model, train_loader, criterion, optimizer, device)
         scheduler.step()
 
@@ -165,10 +197,12 @@ def train(
         record = {
             "epoch": epoch,
             "lr": scheduler.get_last_lr()[0],
+            "seconds": round(time.time() - t_epoch, 1),
             "train": train_parts,
             monitor_tag: show,
         }
         history.append(record)
+        hist_path.write_text(json.dumps(history, indent=2))
 
         improved = (
             monitor_loss < best_loss
@@ -177,30 +211,30 @@ def train(
         )
         if improved:
             best_loss = monitor_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "cfg": cfg.__dict__,
-                    "metrics": show,
-                },
+            save_checkpoint(
                 out_dir / "best.pt",
+                model,
+                cfg,
+                train_ds.feature_groups,
+                train_ds.feature_columns,
+                epoch,
+                show,
+                norm,
             )
 
-        if epoch == 1 or epoch % 5 == 0 or epoch == cfg.epochs:
-            flag = "*" if improved else " "
-            print(
-                f"{flag} epoch {epoch:03d}  "
-                f"{monitor_tag}_loss={show['loss']:.4f}  "
-                f"dir={show['dir']:.4f}  "
-                f"sing={show['sing']:.4f}  "
-                f"align={show['dir_align']:.3f}  "
-                f"sing_acc={show['sing_acc'] * 100:5.1f}%  "
-                f"lr={record['lr']:.2e}"
-            )
+        flag = "*" if improved else " "
+        print(
+            f"{flag} epoch {epoch:03d}  "
+            f"train_loss={train_parts['loss']:.4f}  "
+            f"{monitor_tag}_loss={show['loss']:.4f}  "
+            f"dir={show['dir']:.4f}  "
+            f"sing={show['sing']:.4f}  "
+            f"align={show['dir_align']:.3f}  "
+            f"sing_acc={show['sing_acc'] * 100:5.1f}%  "
+            f"lr={record['lr']:.2e}  {record['seconds']:.0f}s",
+            flush=True,
+        )
 
-    hist_path = out_dir / "history.json"
-    hist_path.write_text(json.dumps(history, indent=2))
     print(f"\nbest {monitor_tag} loss={best_loss:.4f}")
     print(f"checkpoint -> {out_dir / 'best.pt'}")
     print(f"history    -> {hist_path}")
@@ -225,6 +259,22 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Output directory (default: checkpoints). Use a separate dir for experiments.",
     )
+    p.add_argument(
+        "--features",
+        type=str,
+        default=None,
+        help="Comma-separated feature groups from the dataset's metadata.json "
+        "(default: all). E.g. drop skinning: position,normal,principal_directions,"
+        "curvature,area,aspect_ratio,guidance",
+    )
+    p.add_argument(
+        "--norm",
+        choices=("v1", "v2"),
+        default="v2",
+        help="Feature normalization: v2 = per-mesh scale-invariant positions/curvature (default); "
+        "v1 = legacy raw world positions",
+    )
+    p.add_argument("--cache-workers", type=int, default=6, help="Parallel PLY parse before epoch 1")
     return p.parse_args()
 
 
@@ -240,4 +290,7 @@ if __name__ == "__main__":
         ),
         ply_root=args.data,
         checkpoint_dir=Path(args.checkpoint_dir) if args.checkpoint_dir else None,
+        feature_groups=[g.strip() for g in args.features.split(",")] if args.features else None,
+        norm=args.norm,
+        cache_workers=args.cache_workers,
     )

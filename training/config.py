@@ -18,10 +18,29 @@ ROOT_DIR: Path = Path(__file__).resolve().parents[1]
 DATA_DIR: Path = ROOT_DIR / "data"
 CHECKPOINT_DIR: Path = ROOT_DIR / "checkpoints"
 RESULTS_DIR: Path = ROOT_DIR / "results"
+CACHE_DIR: Path = DATA_DIR / ".cache"  # parsed PLY + dual graph + frames (safe to delete)
 
-# Must match mesh_retopo_data_preproc FEATURE_DIM / LABEL_DIM
-FEATURE_DIM: int = 16
-LABEL_DIM: int = 5
+# Feature columns are read from the dataset's metadata.json (mesh_retopo_data_preproc).
+# Datasets without metadata.json use this legacy default layout (16 columns).
+DEFAULT_FEATURE_LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("position", ("center_x", "center_y", "center_z")),
+    ("normal", ("normal_x", "normal_y", "normal_z")),
+    ("principal_directions", ("d1_cos2theta", "d1_sin2theta", "d2_cos2theta", "d2_sin2theta")),
+    ("curvature", ("gaussian_curvature",)),
+    ("area", ("area_norm",)),
+    ("aspect_ratio", ("aspect_ratio",)),
+    ("guidance", ("guidance_cos2theta", "guidance_sin2theta", "guidance_weight")),
+)
+FEATURE_DIM: int = sum(len(cols) for _, cols in DEFAULT_FEATURE_LAYOUT)
+
+LABEL_NAMES: tuple[str, ...] = (
+    "dir0_cos2theta",
+    "dir0_sin2theta",
+    "dir1_cos2theta",
+    "dir1_sin2theta",
+    "singularity_prob",
+)
+LABEL_DIM: int = len(LABEL_NAMES)
 SING_LABEL_SCALE: float = 100.0  # pipeline stores singularity as 0 or 100
 
 

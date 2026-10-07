@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from checkpoint import build_model, load_for_inference
 from config import CHECKPOINT_DIR, RESULTS_DIR, TrainConfig, resolve_device
 from dataset import FaceRetopoDataset
 from field_smooth import neighbor_alignment_score, smooth_cross_field
@@ -62,24 +63,6 @@ def triangulate_faces(
             )
             tri_to_face.append(fi)
     return tris, np.asarray(tri_to_face, dtype=np.int32)
-
-
-def _load_model(cfg: TrainConfig, device: str, ckpt_path: Path) -> FaceRetopoGNN:
-    model = FaceRetopoGNN(
-        in_channels=cfg.in_channels,
-        hidden_channels=cfg.hidden_channels,
-        num_layers=cfg.num_layers,
-        heads=cfg.heads,
-        dropout=cfg.dropout,
-    ).to(device)
-    if ckpt_path.is_file():
-        state = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model"])
-        print(f"loaded {ckpt_path}")
-    else:
-        print(f"no checkpoint at {ckpt_path}; using random weights")
-    model.eval()
-    return model
 
 
 @torch.no_grad()
@@ -196,20 +179,21 @@ def run_export(
 ) -> None:
     cfg = TrainConfig(device="auto")
     device = resolve_device(cfg.device)
+    state, groups, norm = load_for_inference(ckpt_path or (CHECKPOINT_DIR / "best.pt"), device)
     if ply_path:
         path = Path(ply_path)
         if not path.is_file():
             raise FileNotFoundError(f"PLY not found: {path}")
-        ds = FaceRetopoDataset(cfg, paths=[path])
+        ds = FaceRetopoDataset(cfg, paths=[path], feature_groups=groups, norm=norm)
         index = 0
     else:
-        ds = FaceRetopoDataset(cfg, ply_root=ply_root)
+        ds = FaceRetopoDataset(cfg, ply_root=ply_root, feature_groups=groups, norm=norm)
     if index < 0 or index >= len(ds):
         raise IndexError(f"index {index} out of range for {len(ds)} graphs")
     data = ds[index]
 
-    ckpt = ckpt_path or (CHECKPOINT_DIR / "best.pt")
-    model = _load_model(cfg, device, ckpt)
+    model = build_model(cfg, len(ds.feature_columns), device, state)
+    model.eval()
 
     stem = Path(getattr(data, "path", f"sample{index}")).stem
     out_dir = (out_root or (RESULTS_DIR / "export")) / stem

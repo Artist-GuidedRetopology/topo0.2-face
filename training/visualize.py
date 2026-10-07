@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from checkpoint import build_model, load_for_inference
 from config import CHECKPOINT_DIR, RESULTS_DIR, TrainConfig, resolve_device
 from dataset import FaceRetopoDataset
 from geometry_frames import (
@@ -20,7 +21,6 @@ from geometry_frames import (
     dual_axial_to_world,
     median_edge_length,
 )
-from model import FaceRetopoGNN
 
 
 def export_dual_dirs_obj(
@@ -89,7 +89,8 @@ def run_viz(
 ) -> None:
     cfg = TrainConfig(device="auto")
     device = resolve_device(cfg.device)
-    ds = FaceRetopoDataset(cfg, ply_root=ply_root)
+    state, groups, norm = load_for_inference(ckpt_path or (CHECKPOINT_DIR / "best.pt"), device)
+    ds = FaceRetopoDataset(cfg, ply_root=ply_root, feature_groups=groups, norm=norm)
     if index < 0 or index >= len(ds):
         raise IndexError(f"index {index} out of range for {len(ds)} graphs")
     data = ds[index]
@@ -124,22 +125,7 @@ def run_viz(
     scale = 0.45 * edge_len
     print(f"[viz] median edge={edge_len:.5f}  glyph scale={scale:.5f}")
 
-    model = FaceRetopoGNN(
-        in_channels=cfg.in_channels,
-        hidden_channels=cfg.hidden_channels,
-        num_layers=cfg.num_layers,
-        heads=cfg.heads,
-        dropout=cfg.dropout,
-    ).to(device)
-
-    ckpt_path = ckpt_path or (CHECKPOINT_DIR / "best.pt")
-    if ckpt_path.is_file():
-        state = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model"])
-        print(f"loaded {ckpt_path}")
-    else:
-        print("no checkpoint found; using random weights")
-
+    model = build_model(cfg, len(ds.feature_columns), device, state)
     model.eval()
     dir0, dir1, sing = model(data.x.to(device), data.edge_index.to(device))
     dir0_np = dir0.cpu().numpy()
@@ -152,10 +138,10 @@ def run_viz(
     gt_w0, gt_w1 = dual_axial_to_world(
         y_dir[:, 0:2], y_dir[:, 2:4], tangent, bitangent, normal
     )
-    # Feature curvature dirs (cols 6:10) — useful "what the mesh itself says"
-    feat = data.x.numpy()
+    # Input principal-curvature dirs — useful "what the mesh itself says"
+    feat = data.principal_dirs.numpy()
     feat_w0, feat_w1 = dual_axial_to_world(
-        feat[:, 6:8], feat[:, 8:10], tangent, bitangent, normal
+        feat[:, 0:2], feat[:, 2:4], tangent, bitangent, normal
     )
 
     out_dir = RESULTS_DIR / "viz"

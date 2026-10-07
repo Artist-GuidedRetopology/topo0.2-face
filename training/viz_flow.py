@@ -27,11 +27,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from checkpoint import build_model, load_for_inference
 from config import CHECKPOINT_DIR, RESULTS_DIR, TrainConfig, resolve_device
 from dataset import FaceRetopoDataset
 from field_smooth import neighbor_alignment_score, smooth_cross_field
 from geometry_frames import dual_axial_to_world, median_edge_length
-from model import FaceRetopoGNN
 from visualize import export_dual_dirs_obj, export_mesh_obj, report_roundtrip
 
 
@@ -80,14 +80,17 @@ def run_flow_viz(
 ) -> Path:
     cfg = TrainConfig(device="auto")
     device = resolve_device(cfg.device)
+    state, groups, norm = (None, None, "v2")
+    if not gt_only:
+        state, groups, norm = load_for_inference(ckpt_path or (CHECKPOINT_DIR / "best.pt"), device)
     if ply_path:
         path = Path(ply_path)
         if not path.is_file():
             raise FileNotFoundError(f"PLY not found: {path}")
-        ds = FaceRetopoDataset(cfg, paths=[path])
+        ds = FaceRetopoDataset(cfg, paths=[path], feature_groups=groups, norm=norm)
         index = 0
     else:
-        ds = FaceRetopoDataset(cfg, ply_root=ply_root)
+        ds = FaceRetopoDataset(cfg, ply_root=ply_root, feature_groups=groups, norm=norm)
     if index < 0 or index >= len(ds):
         raise IndexError(f"index {index} out of range for {len(ds)} graphs")
     data = ds[index]
@@ -111,20 +114,7 @@ def run_flow_viz(
     pred0 = pred1 = smooth0 = smooth1 = None
     align_mean = None
     if not gt_only:
-        model = FaceRetopoGNN(
-            in_channels=cfg.in_channels,
-            hidden_channels=cfg.hidden_channels,
-            num_layers=cfg.num_layers,
-            heads=cfg.heads,
-            dropout=cfg.dropout,
-        ).to(device)
-        ckpt = ckpt_path or (CHECKPOINT_DIR / "best.pt")
-        if ckpt.is_file():
-            state = torch.load(ckpt, map_location=device, weights_only=False)
-            model.load_state_dict(state["model"])
-            print(f"loaded {ckpt}")
-        else:
-            print(f"no checkpoint at {ckpt}; random weights (flow will look wrong)")
+        model = build_model(cfg, len(ds.feature_columns), device, state)
         model.eval()
         d0, d1, _sing = model(data.x.to(device), data.edge_index.to(device))
         pred0, pred1 = dual_axial_to_world(

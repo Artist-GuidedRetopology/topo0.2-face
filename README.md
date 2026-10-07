@@ -11,28 +11,44 @@ pip install -r requirements.txt
 
 | Field | Shape | Meaning |
 |-------|-------|---------|
-| `x` | `(F, 16)` | center, normal, two principal axial dirs, K, area, aspect, guidance |
+| `x` | `(F, C)` | selected feature groups (default 16: center, normal, two principal axial dirs, K, area, aspect, guidance) |
 | `y_dir` | `(F, 4)` | two GT axial dirs `(cos2θ, sin2θ)` each |
 | `y_sing` | `(F, 1)` | singularity in `{0,1}` (pipeline 0/100 scaled by 100) |
 | `edge_index` | `(2, E)` | face dual graph (shared polygon edges) |
+
+### Feature groups (optional skinning / skeleton)
+
+Columns are resolved **by name** from the dataset's `metadata.json` (written by
+preproc next to the character folders). Datasets without it are read as the
+legacy default 16 columns. Preproc can add 7 optional skinning groups (21 cols):
+`skin_entropy, skin_top_weights, skin_variation, skin_jsd, skin_discontinuity,
+joint_distance, bone_axis` — see preproc `docs/features.md`.
+
+- `train.py --features a,b,...` picks groups (default: every group in the dataset),
+  e.g. train with vs. without skinning on the same data for an ablation.
+- The chosen groups are stored in `best.pt`; `visualize.py` / `viz_flow.py` /
+  `export_field.py` read them and build the matching input automatically.
+  Checkpoints from before this change are treated as the default 16 columns.
+- All PLYs of one dataset must share one layout (preproc enforces this per output dir).
 
 ## Layout
 
 ```
 topo0.2-face/
   training/             # all code; run scripts from the repo root
-    config.py           # paths + TrainConfig
-    dataset.py          # PLY → PyG Data (+ mesh verts / face frames)
+    config.py           # paths, default feature layout, TrainConfig
+    dataset.py          # PLY + metadata.json → PyG Data (+ mesh verts / face frames)
+    checkpoint.py       # best.pt save/load incl. feature groups
     geometry_frames.py  # local (T,B,N) + 2θ encode/decode (matches preproc)
     field_smooth.py     # RoSy neighbor smoothing on face dual graph
     model.py            # FaceRetopoGNN (GATv2, dual dir heads + sing)
     losses.py           # axial + swap-invariant dir loss + BCE sing
-    train.py
+    train.py            # warms data/.cache, logs every epoch, --norm v2 default
+    evaluate.py         # held-out metrics per ckpt + curvature baseline, by dirty / character
     visualize.py        # true tangent-frame OBJ glyphs (pred / gt / feat)
     check_frames.py     # GT 2θ round-trip self-check (no model)
     viz_flow.py         # **look here first** — mesh + flow_gt / flow_pred OBJs
     export_field.py     # remesh-ready package: mesh + world dirs + smooth
-    build_holdout_ufbx.py  # optional: build holdout dirty PLYs without Blender
 
   data/               # preproc PLY datasets (local, git-ignored)
   checkpoints/        # one subdir per run: best.pt + history.json (local, git-ignored)
@@ -61,6 +77,11 @@ python training/train.py --data ./data/<dataset_preproc> --epochs 30 --device au
 python training/visualize.py --data ./data/<dataset_preproc> --ckpt ./checkpoints/<run_name>/best.pt
 python training/check_frames.py --data ./data/tiny_preproc
 
+# datasets from the pipeline with train/ val/ test/ folders use them as-is;
+# evaluate on the held-out characters (writes report.md + metrics.json)
+python training/evaluate.py --data ./data/<dataset>/test \
+  --ckpt a=./checkpoints/<run_a>/best.pt --ckpt b=./checkpoints/<run_b>/best.pt
+
 # visualize flow (recommended validation path)
 python training/viz_flow.py --data ./data/tiny_preproc
 python training/viz_flow.py --data ./data/tiny_preproc --gt-only    # teacher only
@@ -73,7 +94,13 @@ python training/export_field.py --data ./data/tiny_preproc --smooth 15
 Without either, a synthetic face graph is used.
 
 **Note:** Gaussian curvature / aspect are normalized in `dataset.normalize_face_features`
-(`asinh(K)`, `log1p(aspect)`) to avoid NaN from 1e6–1e10 raw K values.
+(`asinh(K)`, `log1p(aspect)`) to avoid NaN from 1e6–1e10 raw K values. With `--norm v2`
+(default for new runs) positions are centered and divided by the mesh bbox diagonal and
+K is made scale-free (`K·diag²`) first, so characters of different scale look alike.
+Old checkpoints without a stored norm are treated as `v1`.
+
+Parsed PLYs are cached in `data/.cache/` (keyed by path, mtime and size); delete it freely.
+On MPS the first epoch is slow (kernel compile per graph size), later epochs are fast.
 
 **Viz outputs** (`results/viz/`): mesh OBJ + `*_pred_dirs.obj` / `*_gt_dirs.obj` /
 `*_feat_dirs.obj` decoded in each face's tangent frame (not XY stub).
