@@ -1,20 +1,32 @@
-"""Save / load best.pt together with the feature selection it was trained on."""
+"""
+Save / load best.pt together with the architecture, feature selection and norm it was trained on.
+
+Checkpoints from before the cross-field architecture (no "arch" in cfg) load as
+the legacy dual-2θ FaceRetopoGNN for evaluation; without stored groups / norm
+they used the default 16 columns and norm v1.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from config import DEFAULT_FEATURE_LAYOUT, TrainConfig
-from model import FaceRetopoGNN
+from model import FaceFieldNet, FaceRetopoGNN
 
-MODEL_KEYS = ("hidden_channels", "num_layers", "heads", "dropout")
+MODEL_KEYS = (
+    "arch", "hidden_channels", "num_layers", "levels", "heads", "dropout",
+    "solver", "solver_levels", "solver_iters",
+)
+LEGACY_KEYS = ("hidden_channels", "num_layers", "heads", "dropout")
+LEGACY_DEFAULTS = {"hidden_channels": 64, "num_layers": 3, "heads": 4, "dropout": 0.1}
 
 
 def save_checkpoint(
     path: Path,
-    model: FaceRetopoGNN,
+    model: FaceFieldNet,
     cfg: TrainConfig,
     feature_groups: list[str],
     feature_columns: list[str],
@@ -36,19 +48,20 @@ def save_checkpoint(
     )
 
 
-def read_checkpoint(path: Path, device: str) -> dict | None:
-    if not path.is_file():
-        return None
-    return torch.load(path, map_location=device, weights_only=False)
+def is_legacy(state: dict | None) -> bool:
+    return state is not None and "arch" not in state.get("cfg", {})
 
 
-def checkpoint_feature_groups(state: dict | None) -> list[str] | None:
-    """Groups the checkpoint expects; checkpoints from before feature selection used the default 16."""
-    if state is None:
-        return None
-    if "feature_groups" in state:
-        return list(state["feature_groups"])
-    return [name for name, _ in DEFAULT_FEATURE_LAYOUT]
+def model_config(cfg: TrainConfig, state: dict | None = None) -> TrainConfig:
+    """cfg with architecture fields taken from the checkpoint when available."""
+    if is_legacy(state):
+        cfg.solver = False
+        return cfg
+    saved = (state or {}).get("cfg", {})
+    for k in MODEL_KEYS:
+        if k in saved:
+            setattr(cfg, k, saved[k])
+    return cfg
 
 
 def build_model(
@@ -56,32 +69,27 @@ def build_model(
     in_channels: int,
     device: str,
     state: dict | None = None,
-) -> FaceRetopoGNN:
-    """Architecture from the checkpoint's cfg when available, else from `cfg`."""
-    saved = (state or {}).get("cfg", {})
-    kwargs = {k: saved.get(k, getattr(cfg, k)) for k in MODEL_KEYS}
-    model = FaceRetopoGNN(in_channels=in_channels, **kwargs).to(device)
+) -> nn.Module:
+    if is_legacy(state):
+        saved = state.get("cfg", {})
+        kwargs = {k: saved.get(k, LEGACY_DEFAULTS[k]) for k in LEGACY_KEYS}
+        model: nn.Module = FaceRetopoGNN(in_channels=in_channels, **kwargs)
+    else:
+        cfg = model_config(cfg, state)
+        model = FaceFieldNet(in_channels=in_channels, **{k: getattr(cfg, k) for k in MODEL_KEYS})
+    model = model.to(device)
     if state is not None:
         model.load_state_dict(state["model"])
     return model
 
 
-def checkpoint_norm(state: dict | None, default: str = "v2") -> str:
-    """Feature normalization the checkpoint was trained with (pre-v2 checkpoints: v1)."""
-    if state is None:
-        return default
-    return state.get("feature_norm", "v1")
-
-
-def load_for_inference(
-    ckpt_path: Path, device: str
-) -> tuple[dict | None, list[str] | None, str]:
-    state = read_checkpoint(ckpt_path, device)
-    if state is None:
-        print(f"no checkpoint at {ckpt_path}; using random weights")
-    else:
-        print(
-            f"loaded {ckpt_path}  features={checkpoint_feature_groups(state)}  "
-            f"norm={checkpoint_norm(state)}"
-        )
-    return state, checkpoint_feature_groups(state), checkpoint_norm(state)
+def load_for_inference(path: Path, device: str) -> tuple[dict, list[str], str]:
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+    state = torch.load(path, map_location=device, weights_only=False)
+    groups = list(state.get("feature_groups") or [name for name, _ in DEFAULT_FEATURE_LAYOUT])
+    norm = state.get("feature_norm", "v1")
+    arch = "legacy dual-2θ" if is_legacy(state) else state["cfg"].get("arch")
+    print(f"loaded {path}  features={groups}  norm={norm}  "
+          f"arch={arch}  solver={state['cfg'].get('solver', False)}")
+    return state, groups, norm

@@ -1,5 +1,5 @@
 """
-Export predicted / GT face axial directions as true 3D .obj line sets.
+Export predicted / GT face cross fields as true 3D .obj line sets.
 
 Decode uses per-face (T, B) frames matching mesh_retopo_data_preproc.
 Also writes a GT round-trip report so frame bugs show up early.
@@ -15,12 +15,8 @@ import torch
 
 from checkpoint import build_model, load_for_inference
 from config import CHECKPOINT_DIR, RESULTS_DIR, TrainConfig, resolve_device
-from dataset import FaceRetopoDataset
-from geometry_frames import (
-    axial_roundtrip_error,
-    dual_axial_to_world,
-    median_edge_length,
-)
+from dataset import dataset_from_root
+from geometry_frames import axial_roundtrip_error, cross_to_world, median_edge_length
 
 
 def export_dual_dirs_obj(
@@ -40,7 +36,7 @@ def export_dual_dirs_obj(
     n = pos.shape[0]
 
     with out_path.open("w", encoding="utf-8") as f:
-        f.write(f"# topo0.2-face dual axial dirs ({comment})\n")
+        f.write(f"# topo0.2-face cross dirs ({comment})\n")
         for v in verts:
             f.write(f"v {v[0]:.8f} {v[1]:.8f} {v[2]:.8f}\n")
         for i in range(n):
@@ -90,34 +86,25 @@ def run_viz(
     cfg = TrainConfig(device="auto")
     device = resolve_device(cfg.device)
     state, groups, norm = load_for_inference(ckpt_path or (CHECKPOINT_DIR / "best.pt"), device)
-    ds = FaceRetopoDataset(cfg, ply_root=ply_root, feature_groups=groups, norm=norm)
+    ds = dataset_from_root(cfg, ply_root, groups, norm)
     if index < 0 or index >= len(ds):
         raise IndexError(f"index {index} out of range for {len(ds)} graphs")
     data = ds[index]
-
-    if not hasattr(data, "face_tangent"):
-        raise RuntimeError(
-            "Data is missing face frames; reload with updated dataset.py"
-        )
 
     tangent = data.face_tangent.numpy()
     bitangent = data.face_bitangent.numpy()
     normal = data.face_normal.numpy()
     pos_np = data.pos.numpy()
-    y_dir = data.y_dir.numpy()
     faces = data.faces
     vertices = data.vertices.numpy()
 
-    rt = report_roundtrip(y_dir, tangent, bitangent, normal)
+    rt = report_roundtrip(data.y_dir.numpy(), tangent, bitangent, normal)
     print(
         f"[frame check] GT round-trip err  "
         f"mean={rt['mean']:.6f}  p95={rt['p95']:.6f}  max={rt['max']:.6f}"
     )
     if rt["mean"] > 1e-3:
-        print(
-            "  ! warning: round-trip error looks high — "
-            "frame/winding may not match preproc"
-        )
+        print("  ! warning: round-trip error looks high — frame/winding may not match preproc")
     else:
         print("  ok: frames look consistent with label encoding")
 
@@ -127,85 +114,42 @@ def run_viz(
 
     model = build_model(cfg, len(ds.feature_columns), device, state)
     model.eval()
-    dir0, dir1, sing = model(data.x.to(device), data.edge_index.to(device))
-    dir0_np = dir0.cpu().numpy()
-    dir1_np = dir1.cpu().numpy()
-    sing_np = sing.cpu().numpy()
+    out = model(data.to(device))
+    sing_np = torch.sigmoid(out["sing_logit"]).cpu().numpy()
 
-    pred_w0, pred_w1 = dual_axial_to_world(
-        dir0_np, dir1_np, tangent, bitangent, normal
-    )
-    gt_w0, gt_w1 = dual_axial_to_world(
-        y_dir[:, 0:2], y_dir[:, 2:4], tangent, bitangent, normal
-    )
-    # Input principal-curvature dirs — useful "what the mesh itself says"
-    feat = data.principal_dirs.numpy()
-    feat_w0, feat_w1 = dual_axial_to_world(
-        feat[:, 0:2], feat[:, 2:4], tangent, bitangent, normal
-    )
+    fields = {
+        "pred": out["cross"].cpu().numpy(),
+        "pre": out["pre"].cpu().numpy(),
+        "gt": data.y_cross.cpu().numpy(),
+        "feat": data.principal.cpu().numpy(),  # input principal curvature — "what the mesh itself says"
+    }
+    world = {k: cross_to_world(v, tangent, bitangent) for k, v in fields.items()}
 
     out_dir = RESULTS_DIR / "viz"
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(getattr(data, "path", "sample")).stem
 
     export_mesh_obj(vertices, faces, out_dir / f"{stem}_mesh.obj")
-    export_dual_dirs_obj(
-        pos_np, pred_w0, pred_w1, out_dir / f"{stem}_pred_dirs.obj", scale, "pred"
-    )
-    export_dual_dirs_obj(
-        pos_np, gt_w0, gt_w1, out_dir / f"{stem}_gt_dirs.obj", scale, "gt"
-    )
-    export_dual_dirs_obj(
-        pos_np,
-        feat_w0,
-        feat_w1,
-        out_dir / f"{stem}_feat_dirs.obj",
-        scale,
-        "feature curvature",
-    )
+    for k, (w0, w1) in world.items():
+        export_dual_dirs_obj(pos_np, w0, w1, out_dir / f"{stem}_{k}_dirs.obj", scale, k)
     np.save(out_dir / f"{stem}_singularity.npy", sing_np)
+    np.save(out_dir / f"{stem}_weight.npy", out["weight"].cpu().numpy())
     np.savez(
         out_dir / f"{stem}_world_dirs.npz",
-        pred_dir0=pred_w0,
-        pred_dir1=pred_w1,
-        gt_dir0=gt_w0,
-        gt_dir1=gt_w1,
         face_centers=pos_np,
+        **{f"{k}_dir{i}": w[i] for k, w in world.items() for i in (0, 1)},
     )
 
-    print(
-        f"sing mean={sing_np.mean():.3f}  "
-        f"min={sing_np.min():.3f}  max={sing_np.max():.3f}"
-    )
+    print(f"sing mean={sing_np.mean():.3f}  min={sing_np.min():.3f}  max={sing_np.max():.3f}")
     print(f"wrote under {out_dir}/")
-    print(
-        f"  {stem}_mesh.obj  {stem}_pred_dirs.obj  "
-        f"{stem}_gt_dirs.obj  {stem}_feat_dirs.obj"
-    )
+    print("  " + "  ".join(f"{stem}_{k}_dirs.obj" for k in world))
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Visualize topo0.2-face predictions in true tangent frames"
-    )
-    p.add_argument(
-        "--data",
-        type=str,
-        default=None,
-        help="Preproc PLY root (same as train.py --data)",
-    )
-    p.add_argument(
-        "--ckpt",
-        type=str,
-        default=None,
-        help="Checkpoint path (default: checkpoints/best.pt)",
-    )
-    p.add_argument(
-        "--index",
-        type=int,
-        default=0,
-        help="Which graph in the dataset to visualize (default 0)",
-    )
+    p = argparse.ArgumentParser(description="Visualize topo0.2-face predictions in true tangent frames")
+    p.add_argument("--data", type=str, default=None, help="Preproc PLY root (same as train.py --data)")
+    p.add_argument("--ckpt", type=str, default=None, help="Checkpoint path (default: checkpoints/best.pt)")
+    p.add_argument("--index", type=int, default=0, help="Which graph in the dataset to visualize (default 0)")
     return p.parse_args()
 
 

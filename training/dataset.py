@@ -4,8 +4,14 @@ Load preproc ASCII PLY face graphs into PyG Data.
 Contract matches mesh_retopo_data_preproc:
   features: feature groups listed in the dataset's metadata.json
             (legacy datasets without it: the default 16 columns)
-  labels:   4 floats (two axial 2θ dirs) + singularity (0 or 100)
+  labels:   two axial 2θ dirs (clean principal dirs, mutually ⟂) + singularity (0 or 100)
   graph:    face dual adjacency via shared polygon edges
+
+Training target is one 4-RoSy cross per face: (cos4θ, sin4θ) = normalized
+(z0² + z1²) of the two axial codes, with weight |z0² + z1²| / 2 (1 when the
+two GT axes are perpendicular). Every dual edge carries the frame transport
+angle ρ so neighboring codes can be compared, plus a coarsening hierarchy
+for the U-Net / solver (see hierarchy.py).
 """
 
 from __future__ import annotations
@@ -25,23 +31,62 @@ from torch_geometric.data import Data, Dataset
 from config import (
     CACHE_DIR,
     DEFAULT_FEATURE_LAYOUT,
+    DERIVED_LAYOUT,
     LABEL_DIM,
     LABEL_NAMES,
     PREPROC_PLY_ROOT,
     SING_LABEL_SCALE,
     TrainConfig,
 )
-from geometry_frames import build_face_frames
+from geometry_frames import (
+    axial_to_cross,
+    build_face_frames,
+    face_centers,
+    mesh_diag,
+    normalize_code,
+    rosy_encode,
+    transport_angles,
+    world_to_axial,
+)
+from hierarchy import MAX_LEVELS, build_hierarchy, edge_attr
 
 # ((group_name, (column, ...)), ...) in PLY column order
 FeatureLayout = tuple[tuple[str, tuple[str, ...]], ...]
 
 METADATA_FILENAME = "metadata.json"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CENTER_COLS = ("center_x", "center_y", "center_z")
 NORMAL_COLS = ("normal_x", "normal_y", "normal_z")
 PRINCIPAL_COLS = ("d1_cos2theta", "d1_sin2theta", "d2_cos2theta", "d2_sin2theta")
+NORMS = ("v2", "v1", "none")
+LEVEL_KEYS = (
+    "pos", "edge_index", "edge_weight", "rho", "edge_attr",
+    "parent", "parent_rho", "pool_index", "pool_attr",
+)
 
+
+class HierData(Data):
+    """Data with per-level graphs (`*_l{k}`) that batch correctly."""
+
+    def _level_nodes(self, k: int) -> int:
+        return self.num_nodes if k == 0 else int(self[f"pos_l{k}"].size(0))
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if "_l" in key:
+            base, _, lvl = key.rpartition("_l")
+            if lvl.isdigit():
+                k = int(lvl)
+                if base == "edge_index" or base == "parent":
+                    return self._level_nodes(k)
+                if base == "pool_index":
+                    return torch.tensor([[self._level_nodes(k - 1)], [self._level_nodes(k)]])
+                return 0
+        return super().__inc__(key, value, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Feature layout / selection
+# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
 def _metadata_layout_in(directory: Path) -> FeatureLayout | None:
@@ -70,11 +115,22 @@ def layout_columns(layout: FeatureLayout) -> list[str]:
     return [col for _, cols in layout for col in cols]
 
 
-def resolve_feature_groups(
-    layout: FeatureLayout, groups: list[str] | None
-) -> list[str]:
-    """None selects every group the dataset provides."""
-    available = [name for name, _ in layout]
+def _derived_layout(layout: FeatureLayout) -> FeatureLayout:
+    """Derived groups this dataset supports (principal_cross needs the principal columns)."""
+    cols = set(layout_columns(layout))
+    return tuple(
+        (name, c) for name, c in DERIVED_LAYOUT
+        if name != "principal_cross" or all(p in cols for p in PRINCIPAL_COLS)
+    )
+
+
+def available_groups(layout: FeatureLayout) -> list[str]:
+    return [name for name, _ in _derived_layout(layout)] + [name for name, _ in layout]
+
+
+def resolve_feature_groups(layout: FeatureLayout, groups: list[str] | None) -> list[str]:
+    """None selects every group (derived + all PLY groups)."""
+    available = available_groups(layout)
     if groups is None:
         return available
     missing = [g for g in groups if g not in available]
@@ -84,26 +140,28 @@ def resolve_feature_groups(
 
 
 def selected_columns(layout: FeatureLayout, groups: list[str]) -> list[str]:
-    by_name = dict(layout)
+    by_name = {**dict(_derived_layout(layout)), **dict(layout)}
     return [col for g in groups for col in by_name[g]]
 
 
-def _list_ply_files(root: str | Path) -> list[Path]:
-    """Return PLY paths recursively (supports character/action nesting)."""
+def list_ply_files(root: str | Path) -> list[Path]:
+    """PLY paths recursively (character/action nesting), deduplicated."""
     root = Path(root)
     if not root.is_dir():
         return []
-    paths = sorted(root.rglob("*.ply"))
-    # Deduplicate while preserving order
     seen: set[Path] = set()
-    unique: list[Path] = []
-    for p in paths:
+    out: list[Path] = []
+    for p in sorted(root.rglob("*.ply")):
         rp = p.resolve()
         if rp not in seen:
             seen.add(rp)
-            unique.append(p)
-    return unique
+            out.append(p)
+    return out
 
+
+# ---------------------------------------------------------------------------
+# PLY parsing + dual graph
+# ---------------------------------------------------------------------------
 
 def _build_face_adjacency(faces: list[np.ndarray]) -> np.ndarray:
     """Directed face-graph edges from shared polygon edges."""
@@ -131,9 +189,7 @@ def _build_face_adjacency(faces: list[np.ndarray]) -> np.ndarray:
     return np.asarray(directed, dtype=np.int64).T
 
 
-def _parse_ply(
-    path: Path,
-) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
+def _parse_ply(path: Path) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
     """
     Parse ASCII PLY with feature_* / label_* face properties.
 
@@ -192,9 +248,7 @@ def _parse_ply(
         raise ValueError(f"{path}: feature/label properties out of order")
     num_features = len(feature_names)
     if len(label_names) != LABEL_DIM:
-        raise ValueError(
-            f"{path}: expected {LABEL_DIM} labels, got {len(label_names)}"
-        )
+        raise ValueError(f"{path}: expected {LABEL_DIM} labels, got {len(label_names)}")
 
     data_start = header_end + 1
     vertex_end = data_start + num_vertices
@@ -231,50 +285,31 @@ def _parse_ply(
     return vertices, faces, features, labels
 
 
-def normalize_face_features(
-    features: np.ndarray,
-    columns: list[str],
-    vertices: np.ndarray | None = None,
-    norm: str = "v1",
-) -> np.ndarray:
-    """
-    Stabilize preproc feature scales before the GNN (columns looked up by name).
-
-    Gaussian K is often 1e6–1e10 and aspect ratio often >>1. Skinning columns are
-    already bounded fractions / TV / bits / scale-normalized distances.
-
-    norm="v1": legacy (raw world positions, asinh(K)).
-    norm="v2": per-mesh scale invariance — positions centered and divided by the
-    mesh bbox diagonal, K multiplied by diagonal² before asinh. Characters come
-    in very different units, so v1 positions/K do not transfer across them.
-    """
-    x = features.astype(np.float32, copy=True)
-    col = {name: i for i, name in enumerate(columns)}
-    if norm == "v2":
-        if vertices is None or len(vertices) == 0:
-            raise ValueError("norm v2 needs mesh vertices")
-        lo, hi = vertices.min(axis=0), vertices.max(axis=0)
-        diag = float(np.linalg.norm(hi - lo)) or 1.0
-        center = 0.5 * (lo + hi)
-        if all(c in col for c in CENTER_COLS):
-            idx = [col[c] for c in CENTER_COLS]
-            x[:, idx] = (x[:, idx] - center) / diag
-        if "gaussian_curvature" in col:
-            x[:, col["gaussian_curvature"]] *= diag * diag
-    elif norm != "v1":
-        raise ValueError(f"unknown feature norm {norm!r}")
-    if "gaussian_curvature" in col:
-        x[:, col["gaussian_curvature"]] = np.arcsinh(x[:, col["gaussian_curvature"]])
-    if "aspect_ratio" in col:
-        i = col["aspect_ratio"]
-        x[:, i] = np.log1p(np.clip(x[:, i], 0.0, None))
-    return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def _columns_or_none(raw: np.ndarray, col: dict[str, int], names: tuple[str, ...]) -> np.ndarray | None:
     if not all(n in col for n in names):
         return None
     return raw[:, [col[n] for n in names]].astype(np.float32, copy=True)
+
+
+def _geometry(vertices: np.ndarray, faces: list[np.ndarray], normals: np.ndarray | None) -> dict[str, np.ndarray]:
+    """Dual graph, preproc face frames, per-edge transport and the hierarchy for one mesh."""
+    edge_index = _build_face_adjacency(faces)
+    t, b, n = build_face_frames(vertices.astype(np.float64), faces, normals=normals)
+    centers = face_centers(vertices, faces)
+    dist = (
+        np.linalg.norm(centers[edge_index[0]] - centers[edge_index[1]], axis=1).astype(np.float32)
+        if edge_index.size else np.empty(0, np.float32)
+    )
+    return {
+        "edge_index": edge_index,
+        "centers": centers,
+        "tangent": t,
+        "bitangent": b,
+        "normal": n,
+        "rho": transport_angles(edge_index, t, b, n),
+        "edge_len": dist,
+        **build_hierarchy(centers, n, t, b, edge_index, MAX_LEVELS),
+    }
 
 
 def _cache_path(path: Path) -> Path:
@@ -284,7 +319,7 @@ def _cache_path(path: Path) -> Path:
 
 
 def _load_parsed(path: Path, columns: list[str]) -> dict[str, np.ndarray]:
-    """Parse PLY + dual graph + frames once; reuse from data/.cache afterwards."""
+    """Parse PLY + dual graph + frames + hierarchy once; reuse from data/.cache afterwards."""
     cache = _cache_path(path)
     if cache.is_file():
         try:
@@ -295,26 +330,16 @@ def _load_parsed(path: Path, columns: list[str]) -> dict[str, np.ndarray]:
 
     vertices, faces, raw, labels = _parse_ply(path)
     if raw.shape[1] != len(columns):
-        raise ValueError(
-            f"{path}: {raw.shape[1]} feature columns but layout lists {len(columns)}"
-        )
+        raise ValueError(f"{path}: {raw.shape[1]} feature columns but layout lists {len(columns)}")
     col = {name: i for i, name in enumerate(columns)}
     # Frames use pre-normalize normals (same space as label encoding).
-    tangent, bitangent, normal = build_face_frames(
-        vertices.astype(np.float64),
-        faces,
-        normals=_columns_or_none(raw, col, NORMAL_COLS),
-    )
     parsed = {
         "vertices": vertices,
         "face_sizes": np.asarray([len(f) for f in faces], dtype=np.int32),
         "face_indices": np.concatenate(faces).astype(np.int32),
         "raw": raw,
         "labels": labels,
-        "edge_index": _build_face_adjacency(faces),
-        "tangent": tangent,
-        "bitangent": bitangent,
-        "normal": normal,
+        **_geometry(vertices, faces, _columns_or_none(raw, col, NORMAL_COLS)),
     }
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = cache.with_name(f"{cache.stem}.{os.getpid()}.tmp.npz")
@@ -323,284 +348,326 @@ def _load_parsed(path: Path, columns: list[str]) -> dict[str, np.ndarray]:
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# Labels, normalization, Data assembly
+# ---------------------------------------------------------------------------
+
+def labels_to_cross(axial4: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(F, 4) two axial codes → ((F, 2) unit cross, (F, 1) weight = |z0² + z1²| / 2)."""
+    z = axial_to_cross(axial4[:, 0:2]) + axial_to_cross(axial4[:, 2:4])
+    weight = (0.5 * np.linalg.norm(z, axis=1, keepdims=True)).astype(np.float32)
+    return normalize_code(z), weight
+
+
+def frame_axes_features(tangent: np.ndarray, bitangent: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    """World X/Y/Z seen from each face frame: (cos4φ, sin4φ, |proj|) × 3 → (F, 9)."""
+    t, b, n = (np.asarray(a, np.float64) for a in (tangent, bitangent, normal))
+    cols = []
+    for axis in np.eye(3):
+        code, valid = rosy_encode(np.broadcast_to(axis, n.shape), t, b, n)
+        proj = np.sqrt(np.clip(1.0 - (n @ axis) ** 2, 0.0, 1.0))
+        cols.append(np.concatenate([code * valid[:, None], proj[:, None]], axis=1))
+    return np.concatenate(cols, axis=1).astype(np.float32)
+
+
+def normalize_face_features(
+    features: np.ndarray,
+    columns: list[str],
+    vertices: np.ndarray | None = None,
+    norm: str = "v2",
+) -> np.ndarray:
+    """
+    Stabilize preproc feature scales (columns looked up by name).
+
+    v2:   centers centered + divided by the mesh bbox diagonal, K·diag² then asinh,
+          log1p(aspect) — characters come in very different units
+    v1:   legacy (raw world positions, asinh(K), log1p(aspect))
+    none: raw values (only NaN/inf cleanup)
+    Skinning columns are already bounded fractions / TV / bits / scale-normalized distances.
+    """
+    if norm not in NORMS:
+        raise ValueError(f"unknown feature norm {norm!r}; choose from {NORMS}")
+    x = features.astype(np.float32, copy=True)
+    col = {name: i for i, name in enumerate(columns)}
+    if norm == "v2":
+        if vertices is None or len(vertices) == 0:
+            raise ValueError("norm v2 needs mesh vertices")
+        lo, hi = vertices.min(axis=0), vertices.max(axis=0)
+        diag = mesh_diag(vertices)
+        if all(c in col for c in CENTER_COLS):
+            idx = [col[c] for c in CENTER_COLS]
+            x[:, idx] = (x[:, idx] - 0.5 * (lo + hi)) / diag
+        if "gaussian_curvature" in col:
+            x[:, col["gaussian_curvature"]] *= diag * diag
+    if norm != "none":
+        if "gaussian_curvature" in col:
+            x[:, col["gaussian_curvature"]] = np.arcsinh(x[:, col["gaussian_curvature"]])
+        if "aspect_ratio" in col:
+            i = col["aspect_ratio"]
+            x[:, i] = np.log1p(np.clip(x[:, i], 0.0, None))
+    return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _principal_cross(raw: np.ndarray, col: dict[str, int]) -> np.ndarray:
+    pr = _columns_or_none(raw, col, PRINCIPAL_COLS)
+    if pr is None:
+        return np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (len(raw), 1))
+    return labels_to_cross(pr)[0]
+
+
+def parsed_to_data(
+    p: dict[str, np.ndarray],
+    columns: list[str],
+    layout: FeatureLayout,
+    groups: list[str],
+    norm: str,
+    with_mesh: bool,
+    path: str,
+    levels: int = 3,
+) -> HierData:
+    if levels > MAX_LEVELS:
+        raise ValueError(f"levels={levels} > MAX_LEVELS={MAX_LEVELS}")
+    raw = p["raw"]
+    col = {name: i for i, name in enumerate(columns)}
+    principal = _principal_cross(raw, col)
+
+    derived = {"frame_axes": frame_axes_features(p["tangent"], p["bitangent"], p["normal"]),
+               "principal_cross": principal}
+    norm_raw = normalize_face_features(raw, columns, vertices=p["vertices"], norm=norm)
+    blocks = []
+    for g in groups:
+        if g in derived:
+            blocks.append(derived[g])
+        else:
+            blocks.append(norm_raw[:, [col[c] for c in dict(layout)[g]]])
+    x = np.ascontiguousarray(np.concatenate(blocks, axis=1).astype(np.float32))
+
+    labels = p["labels"]
+    y_dir = labels[:, 0:4].astype(np.float32, copy=True)
+    y_cross, y_weight = labels_to_cross(y_dir)
+    y_sing = (labels[:, 4:5] / SING_LABEL_SCALE).clip(0.0, 1.0).astype(np.float32)
+
+    data = HierData(
+        x=torch.from_numpy(x),
+        edge_index=torch.from_numpy(p["edge_index"].astype(np.int64)),
+        edge_attr=torch.from_numpy(edge_attr(p["rho"], p["edge_len"])),
+        rho=torch.from_numpy(p["rho"].astype(np.float32)),
+        y_cross=torch.from_numpy(y_cross),
+        y_weight=torch.from_numpy(y_weight),
+        y_sing=torch.from_numpy(y_sing),
+        principal=torch.from_numpy(principal),
+        num_nodes=x.shape[0],
+        path=path,
+    )
+    for k in range(1, levels + 1):
+        for base in LEVEL_KEYS:
+            data[f"{base}_l{k}"] = torch.from_numpy(np.ascontiguousarray(p[f"{base}_l{k}"]))
+    if with_mesh:
+        # Mesh + frames for decode / viz / remesh export (not used by the net)
+        data.y_dir = torch.from_numpy(y_dir)
+        data.pos = torch.from_numpy(p["centers"])
+        data.vertices = torch.from_numpy(p["vertices"])
+        data.face_tangent = torch.from_numpy(p["tangent"].astype(np.float32))
+        data.face_bitangent = torch.from_numpy(p["bitangent"].astype(np.float32))
+        data.face_normal = torch.from_numpy(p["normal"].astype(np.float32))
+        # Variable-length faces stay on CPU as a Python list (PyG-safe)
+        data.faces = np.split(p["face_indices"], np.cumsum(p["face_sizes"])[:-1])
+    return data
+
+
 def ply_to_data(
     path: Path,
     feature_groups: list[str] | None = None,
-    norm: str = "v1",
+    norm: str = "v2",
     with_mesh: bool = True,
-) -> Data:
-    """Convert one preproc PLY into a face-graph Data object.
-
-    `feature_groups` picks which metadata groups form `x` (None = all).
-    `with_mesh=False` keeps only what training needs (x, graph, labels).
-    """
+    levels: int = 3,
+) -> HierData:
+    """One preproc PLY → HierData. `feature_groups` picks the input groups (None = all)."""
     path = Path(path)
     layout = feature_layout(path)
     columns = layout_columns(layout)
     groups = resolve_feature_groups(layout, feature_groups)
     p = _load_parsed(path, columns)
-    raw, vertices = p["raw"], p["vertices"]
-    col = {name: i for i, name in enumerate(columns)}
-
-    features = normalize_face_features(raw, columns, vertices=vertices, norm=norm)
-    features = features[:, [col[c] for c in selected_columns(layout, groups)]]
-    y_dir = p["labels"][:, 0:4].astype(np.float32, copy=True)
-    # Ensure unit axial dirs (guard against corrupt rows)
-    for sl in (slice(0, 2), slice(2, 4)):
-        n = np.linalg.norm(y_dir[:, sl], axis=1, keepdims=True)
-        y_dir[:, sl] = y_dir[:, sl] / np.maximum(n, 1e-8)
-    y_sing = (p["labels"][:, 4:5] / SING_LABEL_SCALE).clip(0.0, 1.0).astype(np.float32)
-    principal = _columns_or_none(raw, col, PRINCIPAL_COLS)
-    if principal is None:
-        principal = np.zeros((raw.shape[0], 4), dtype=np.float32)
-
-    data = Data(
-        x=torch.from_numpy(np.ascontiguousarray(features)),
-        edge_index=torch.from_numpy(p["edge_index"].astype(np.int64)),
-        y_dir=torch.from_numpy(y_dir),
-        y_sing=torch.from_numpy(y_sing),
-        # Input principal-curvature dirs (curvature-copy baseline / viz)
-        principal_dirs=torch.from_numpy(principal),
-        num_nodes=features.shape[0],
-        path=str(path),
-    )
-    if not with_mesh:
-        return data
-
-    faces = np.split(p["face_indices"], np.cumsum(p["face_sizes"])[:-1])
-    pos = _columns_or_none(raw, col, CENTER_COLS)
-    if pos is None:
-        pos = np.stack([vertices[f].mean(axis=0) for f in faces]).astype(np.float32)
-    # Mesh + frames for decode / viz / later remesh export (not used by GNN)
-    data.pos = torch.from_numpy(pos)
-    data.vertices = torch.from_numpy(vertices)
-    data.face_tangent = torch.from_numpy(p["tangent"])
-    data.face_bitangent = torch.from_numpy(p["bitangent"])
-    data.face_normal = torch.from_numpy(p["normal"])
-    # Variable-length faces stay on CPU as a Python list (PyG-safe)
-    data.faces = faces
-    return data
+    return parsed_to_data(p, columns, layout, groups, norm, with_mesh, str(path), levels)
 
 
-def build_synthetic(
-    cfg: TrainConfig,
-    seed: int | None = None,
-    feature_groups: list[str] | None = None,
-) -> Data:
-    """Random face dual graph with the legacy default 16-column layout."""
-    rng = np.random.default_rng(seed if seed is not None else cfg.seed)
-    f = cfg.synth_num_faces
-    k = cfg.synth_avg_degree
+# ---------------------------------------------------------------------------
+# Synthetic: noisy icospheres with a latitude cross field (pole faces = singular)
+# ---------------------------------------------------------------------------
 
-    centers = rng.normal(size=(f, 3)).astype(np.float32)
-    normals = centers / np.clip(np.linalg.norm(centers, axis=1, keepdims=True), 1e-6, None)
+@lru_cache(maxsize=64)
+def synthetic_parsed(seed: int, subdiv: int = 3) -> dict[str, np.ndarray]:
+    import trimesh
 
-    # Two random axial fields on the unit circle
-    theta0 = rng.uniform(0, np.pi, size=f).astype(np.float32)
-    theta1 = theta0 + np.pi / 2
-    d0 = np.stack([np.cos(2 * theta0), np.sin(2 * theta0)], axis=1)
-    d1 = np.stack([np.cos(2 * theta1), np.sin(2 * theta1)], axis=1)
+    rng = np.random.default_rng(seed)
+    sphere = trimesh.creation.icosphere(subdivisions=subdiv, radius=1.0)
+    verts = np.asarray(sphere.vertices, dtype=np.float64)
+    verts *= (1.0 + 0.03 * rng.standard_normal(len(verts)))[:, None]
+    verts *= rng.uniform(0.5, 2.0)
+    verts = verts.astype(np.float32)
+    faces = [np.asarray(f, dtype=np.int32) for f in sphere.faces]
+    geo = _geometry(verts, faces, None)
+    t, b, n = geo["tangent"], geo["bitangent"], geo["normal"]
+    centers = geo["centers"].astype(np.float64)
 
-    gaussian = rng.normal(size=(f, 1)).astype(np.float32)
-    area = np.full((f, 1), 1.0 / f, dtype=np.float32)
-    aspect = rng.uniform(1.0, 3.0, size=(f, 1)).astype(np.float32)
-    guidance = np.zeros((f, 3), dtype=np.float32)
+    latitude = np.cross(np.array([0.0, 0.0, 1.0]), centers)
+    d0 = world_to_axial(latitude, n, t, b)
+    d1 = world_to_axial(np.cross(n, latitude), n, t, b)
+    unit = centers / np.linalg.norm(centers, axis=1, keepdims=True)
+    pole = np.abs(unit[:, 2]) > 0.97
 
-    x = np.concatenate(
-        [centers, normals, d0, d1, gaussian, area, aspect, guidance],
-        axis=1,
-    ).astype(np.float32)
+    nf = len(faces)
     columns = layout_columns(DEFAULT_FEATURE_LAYOUT)
-    assert x.shape[1] == len(columns)
-    groups = resolve_feature_groups(DEFAULT_FEATURE_LAYOUT, feature_groups)
-    col = {name: i for i, name in enumerate(columns)}
-    x = np.ascontiguousarray(x[:, [col[c] for c in selected_columns(DEFAULT_FEATURE_LAYOUT, groups)]])
+    col = {c: i for i, c in enumerate(columns)}
+    raw = np.zeros((nf, len(columns)), dtype=np.float32)
+    raw[:, [col[c] for c in CENTER_COLS]] = centers
+    raw[:, [col[c] for c in NORMAL_COLS]] = n
+    raw[:, col["d1_cos2theta"]] = 1.0  # uninformative principal dirs (sphere is umbilic)
+    raw[:, col["d2_cos2theta"]] = -1.0
+    r = float(np.linalg.norm(centers, axis=1).mean())
+    raw[:, col["gaussian_curvature"]] = 1.0 / (r * r)
+    raw[:, col["area_norm"]] = 1.0 / nf
+    raw[:, col["aspect_ratio"]] = 1.0
 
-    # Ring + random dual edges
-    edges: set[tuple[int, int]] = set()
-    for i in range(f):
-        edges.add((i, (i + 1) % f))
-        for j in rng.choice(f, size=max(k - 2, 1), replace=False):
-            if int(j) != i:
-                a, b = min(i, int(j)), max(i, int(j))
-                edges.add((a, b))
-    ei = np.array([[a, b] for a, b in edges], dtype=np.int64)
-    both = np.concatenate([ei, ei[:, ::-1]], axis=0)
+    labels = np.zeros((nf, LABEL_DIM), dtype=np.float32)
+    labels[:, 0:2] = d0
+    labels[:, 2:4] = d1
+    labels[:, 4] = np.where(pole, SING_LABEL_SCALE, 0.0)
+    return {
+        "vertices": verts,
+        "face_sizes": np.full(nf, 3, dtype=np.int32),
+        "face_indices": np.concatenate(faces).astype(np.int32),
+        "raw": raw,
+        "labels": labels,
+        **geo,
+    }
 
-    # Singularity: ~20% non-quad
-    sing = (rng.random(f) < 0.2).astype(np.float32)[:, None]
-    y_dir = np.concatenate([d0, d1], axis=1).astype(np.float32)
 
-    # Synthetic "mesh": one degenerate tri per face-center (viz / frame only)
-    vertices = centers.copy()
-    faces = [np.array([i, i, i], dtype=np.int32) for i in range(f)]
-    # Build T/B from normals without relying on edges
-    tangent = np.zeros((f, 3), dtype=np.float32)
-    bitangent = np.zeros((f, 3), dtype=np.float32)
-    for i in range(f):
-        n = normals[i].astype(np.float64)
-        axis = (
-            np.array([1.0, 0.0, 0.0])
-            if abs(n[0]) < 0.9
-            else np.array([0.0, 1.0, 0.0])
-        )
-        t = axis - np.dot(axis, n) * n
-        t /= max(np.linalg.norm(t), 1e-12)
-        b = np.cross(n, t)
-        tangent[i] = t.astype(np.float32)
-        bitangent[i] = b.astype(np.float32)
-
-    return Data(
-        x=torch.from_numpy(x),
-        edge_index=torch.from_numpy(both.T.copy()),
-        y_dir=torch.from_numpy(y_dir),
-        y_sing=torch.from_numpy(sing),
-        pos=torch.from_numpy(centers),
-        principal_dirs=torch.from_numpy(np.concatenate([d0, d1], axis=1).astype(np.float32)),
-        vertices=torch.from_numpy(vertices),
-        face_tangent=torch.from_numpy(tangent),
-        face_bitangent=torch.from_numpy(bitangent),
-        face_normal=torch.from_numpy(normals.astype(np.float32)),
-        faces=faces,
-        num_nodes=f,
-        path="synthetic",
-    )
-
+# ---------------------------------------------------------------------------
+# Dataset + splits
+# ---------------------------------------------------------------------------
 
 def resolve_ply_root(ply_root: str | None = None) -> str | None:
     """CLI/path override wins; else config.PREPROC_PLY_ROOT; else None (synthetic)."""
-    if ply_root:
-        return ply_root
-    return PREPROC_PLY_ROOT
+    return ply_root or PREPROC_PLY_ROOT
 
 
 class FaceRetopoDataset(Dataset):
-    """Lazy list of face-graph samples from preproc PLYs (or one synthetic).
+    """Lazy list of face-graph samples (PLY paths, or synthetic seeds).
 
     All PLYs must share one feature layout. `feature_groups` selects the groups
-    that form `x` (None = every group the dataset provides).
+    that form `x` (None = every derived + PLY group).
     """
 
     def __init__(
         self,
         cfg: TrainConfig | None = None,
         paths: list[Path] | None = None,
-        ply_root: str | None = None,
+        synthetic_seeds: list[int] | None = None,
         feature_groups: list[str] | None = None,
-        norm: str = "v1",
+        norm: str = "v2",
         with_mesh: bool = True,
     ):
         super().__init__(root=None)
         self.cfg = cfg or TrainConfig()
         self.norm = norm
         self.with_mesh = with_mesh
-        root = resolve_ply_root(ply_root)
-        if paths is not None:
-            self.paths = paths
-            self._synthetic: Data | None = None
-        elif root:
-            self.paths = _list_ply_files(root)
-            self._synthetic = None
-            if not self.paths:
-                raise FileNotFoundError(f"No .ply files under {root!r}")
-        else:
-            self.paths = []
-            self._synthetic = None
-
+        self.paths = list(paths or [])
+        self.synthetic_seeds = list(synthetic_seeds or [])
+        if not self.paths and not self.synthetic_seeds:
+            raise ValueError("dataset needs PLY paths or synthetic seeds")
         self.layout = feature_layout(self.paths[0]) if self.paths else DEFAULT_FEATURE_LAYOUT
         self.feature_groups = resolve_feature_groups(self.layout, feature_groups)
         self.feature_columns = selected_columns(self.layout, self.feature_groups)
-        if not self.paths:
-            self._synthetic = build_synthetic(self.cfg, feature_groups=self.feature_groups)
-            print("[dataset] no --data / PREPROC_PLY_ROOT -> synthetic face graph")
 
     def len(self) -> int:
-        return 1 if self._synthetic is not None else len(self.paths)
+        return len(self.paths) or len(self.synthetic_seeds)
 
-    def get(self, idx: int) -> Data:
-        if self._synthetic is not None:
-            return self._synthetic
+    def get(self, idx: int) -> HierData:
+        if self.synthetic_seeds:
+            seed = self.synthetic_seeds[idx]
+            p = synthetic_parsed(seed, self.cfg.synth_subdiv)
+            return parsed_to_data(
+                p, layout_columns(DEFAULT_FEATURE_LAYOUT), self.layout, self.feature_groups,
+                self.norm, self.with_mesh, f"synthetic_{seed}", self.cfg.levels,
+            )
         path = self.paths[idx]
         if feature_layout(path) != self.layout:
             raise ValueError(f"{path}: feature layout differs from {self.paths[0]}")
-        return ply_to_data(path, self.feature_groups, norm=self.norm, with_mesh=self.with_mesh)
+        return ply_to_data(path, self.feature_groups, norm=self.norm, with_mesh=self.with_mesh,
+                           levels=self.cfg.levels)
+
+
+def dataset_from_root(
+    cfg: TrainConfig,
+    ply_root: str | None,
+    feature_groups: list[str] | None,
+    norm: str,
+    with_mesh: bool = True,
+) -> FaceRetopoDataset:
+    """Every PLY under ply_root, or synthetic spheres without a root (viz / export)."""
+    root = resolve_ply_root(ply_root)
+    if not root:
+        return FaceRetopoDataset(cfg, synthetic_seeds=[cfg.seed * 1000], feature_groups=feature_groups,
+                                 norm=norm, with_mesh=with_mesh)
+    paths = list_ply_files(root)
+    if not paths:
+        raise FileNotFoundError(f"No .ply files under {root!r}")
+    return FaceRetopoDataset(cfg, paths=paths, feature_groups=feature_groups, norm=norm, with_mesh=with_mesh)
 
 
 def load_datasets(
     cfg: TrainConfig | None = None,
     ply_root: str | None = None,
     feature_groups: list[str] | None = None,
-    norm: str = "v1",
-    with_mesh: bool = True,
+    norm: str = "v2",
+    with_mesh: bool = False,
 ) -> tuple[FaceRetopoDataset, FaceRetopoDataset | None]:
     """
-    Build train (and optional val) datasets.
-
-    If the root has `train/` (and `val/`) subfolders — the Animation_Mesh_Pipeline
-    stage 3 split-by-character layout — those are used as-is (`test/` is left
-    for evaluate.py). Otherwise hold out val_ratio of parent sample directories;
-    all dirty strengths derived from one clean pose stay in the same split.
-    With synthetic: train only (single graph).
+    train/ + val/ subfolders (Animation_Mesh_Pipeline stage 3) are used as-is
+    (test/ is left for evaluate.py). Otherwise hold out val_ratio of groups:
+    cfg.split_by="character" groups by the first folder under the root (no
+    character in both splits), "sample" by the PLY's parent folder (all dirty
+    strengths of one clean pose stay together). No root → synthetic spheres.
     """
     cfg = cfg or TrainConfig()
-    root = resolve_ply_root(ply_root)
     kw = dict(feature_groups=feature_groups, norm=norm, with_mesh=with_mesh)
+    root = resolve_ply_root(ply_root)
     if not root:
-        train_ds = FaceRetopoDataset(cfg, **kw)
-        return train_ds, None
+        n_val = max(1, int(round(cfg.synth_graphs * cfg.val_ratio)))
+        seeds = [cfg.seed * 1000 + i for i in range(cfg.synth_graphs + n_val)]
+        print(f"[dataset] no --data -> synthetic spheres: train={cfg.synth_graphs}, val={n_val}")
+        return (
+            FaceRetopoDataset(cfg, synthetic_seeds=seeds[: cfg.synth_graphs], **kw),
+            FaceRetopoDataset(cfg, synthetic_seeds=seeds[cfg.synth_graphs :], **kw),
+        )
 
     if (Path(root) / "train").is_dir():
-        train_paths = _list_ply_files(Path(root) / "train")
-        val_paths = _list_ply_files(Path(root) / "val")
-        print(
-            f"[dataset] split folders under {root}: "
-            f"train={len(train_paths)} PLYs, val={len(val_paths)} PLYs"
-        )
-        train_ds = FaceRetopoDataset(cfg, paths=train_paths, **kw)
-        val_ds = FaceRetopoDataset(cfg, paths=val_paths, **kw) if val_paths else None
-        if val_ds is not None and val_ds.layout != train_ds.layout:
-            raise ValueError("train / val PLYs have different feature layouts")
-        return train_ds, val_ds
+        train_paths = list_ply_files(Path(root) / "train")
+        val_paths = list_ply_files(Path(root) / "val")
+        print(f"[dataset] split folders under {root}: train={len(train_paths)}, val={len(val_paths)} PLYs")
+    else:
+        paths = list_ply_files(root)
+        if not paths:
+            raise FileNotFoundError(f"No .ply files under {root!r}")
+        groups: dict[str, list[Path]] = {}
+        for path in paths:
+            rel = path.relative_to(root)
+            key = rel.parts[0] if cfg.split_by == "character" and len(rel.parts) > 1 else str(path.parent)
+            groups.setdefault(key, []).append(path)
+        keys = sorted(groups)
+        n_val = max(1, int(round(len(keys) * cfg.val_ratio))) if len(keys) > 1 else 0
+        order = np.random.default_rng(cfg.seed).permutation(len(keys))
+        val_keys = {keys[int(i)] for i in order[:n_val]}
+        train_paths = [p for k in keys if k not in val_keys for p in groups[k]]
+        val_paths = [p for k in keys if k in val_keys for p in groups[k]]
+        print(f"[dataset] {len(paths)} PLYs, split by {cfg.split_by}: "
+              f"train={len(keys) - n_val}, val={n_val}"
+              + (f" ({', '.join(sorted(val_keys))})" if cfg.split_by == "character" else ""))
 
-    paths = _list_ply_files(root)
-    if not paths:
-        raise FileNotFoundError(f"No .ply files under {root!r}")
-    print(f"[dataset] found {len(paths)} PLY files under {root}")
-
-    groups: dict[Path, list[Path]] = {}
-    for path in paths:
-        groups.setdefault(path.parent.resolve(), []).append(path)
-
-    rng = np.random.default_rng(cfg.seed)
-    group_keys = sorted(groups)
-    n_val_groups = (
-        max(1, int(round(len(group_keys) * cfg.val_ratio)))
-        if len(group_keys) > 1
-        else 0
-    )
-    order = rng.permutation(len(group_keys))
-    val_keys = {
-        group_keys[int(i)]
-        for i in order[:n_val_groups]
-    }
-    train_paths = [
-        path
-        for key in group_keys
-        if key not in val_keys
-        for path in groups[key]
-    ]
-    val_paths = [
-        path
-        for key in group_keys
-        if key in val_keys
-        for path in groups[key]
-    ]
-    print(
-        f"[dataset] split by clean-pose groups: "
-        f"train={len(group_keys) - n_val_groups}, val={n_val_groups}"
-    )
-
-    train_ds = FaceRetopoDataset(cfg, paths=train_paths or paths, **kw)
+    if not train_paths:
+        raise FileNotFoundError(f"No training PLYs under {root!r}")
+    train_ds = FaceRetopoDataset(cfg, paths=train_paths, **kw)
     val_ds = FaceRetopoDataset(cfg, paths=val_paths, **kw) if val_paths else None
     if val_ds is not None and val_ds.layout != train_ds.layout:
         raise ValueError("train / val PLYs have different feature layouts")
